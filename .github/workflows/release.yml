@@ -24,3 +24,8 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update Homebrew tap
+        run: |
+          gh workflow run update-cctop.yml --repo montanaflynn/homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
