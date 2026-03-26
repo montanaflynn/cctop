@@ -1,0 +1,32 @@
+version: 2
+
+builds:
+  - main: .
+    binary: cctop
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+brews:
+  - repository:
+      owner: montanaflynn
+      name: homebrew-tap
+    homepage: https://github.com/montanaflynn/cctop
+    description: TUI for monitoring Claude Code sessions
+    license: MIT
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
