@@ -12,6 +12,12 @@ A terminal UI for monitoring and managing your running [Claude Code](https://doc
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install montanaflynn/tap/cctop
+```
+
 ### Go
 
 ```sh
