@@ -523,10 +523,10 @@ func sessionStateFromStats(p processInfo, stats *sessionStats, path string) (sta
 		}
 		// Check content blocks for tool_use — stop_reason is unreliable
 		// per Claude Code source (messages.ts:834).
-		// tool_use = either executing a tool or waiting for permission
-		// approval — both are active states from JSONL perspective.
+		// tool_use = session needs user action (permission approval,
+		// AskUserQuestion, ExitPlanMode, etc.)
 		if entry.hasToolUse() {
-			return "working", lastActive
+			return "waiting", lastActive
 		}
 		// No tool_use blocks = response complete, unless still streaming
 		// (empty stop_reason + fresh file = still generating)
