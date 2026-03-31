@@ -497,6 +497,17 @@ func sessionStateFromStats(p processInfo, stats *sessionStats, path string) (sta
 
 	switch entry.Type {
 	case "system":
+		switch entry.Subtype {
+		case "api_retry":
+			// Retrying an API call — still working, not idle
+			return "working", lastActive
+		case "compact_boundary":
+			// Context compaction in progress
+			if !stale {
+				return "working", lastActive
+			}
+		}
+		// turn_duration and other system subtypes = turn is over
 		return "idle", lastActive
 
 	case "user":
@@ -507,17 +518,19 @@ func sessionStateFromStats(p processInfo, stats *sessionStats, path string) (sta
 		return "idle", lastActive
 
 	case "assistant":
+		if stale {
+			return "idle", lastActive
+		}
 		// Check content blocks for tool_use — stop_reason is unreliable
-		// per Claude Code source (messages.ts:834)
+		// per Claude Code source (messages.ts:834).
+		// tool_use = either executing a tool or waiting for permission
+		// approval — both are active states from JSONL perspective.
 		if entry.hasToolUse() {
-			if stale {
-				return "idle", lastActive
-			}
-			return "waiting", lastActive
+			return "working", lastActive
 		}
 		// No tool_use blocks = response complete, unless still streaming
 		// (empty stop_reason + fresh file = still generating)
-		if entry.Message.StopReason == "" && !stale {
+		if entry.Message.StopReason == "" {
 			return "working", lastActive
 		}
 		return "idle", lastActive
