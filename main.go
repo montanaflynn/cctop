@@ -540,12 +540,11 @@ func inferStateFromLastEntry(line string, mtime time.Time, lastActive string) (s
 		if stale {
 			return "idle", lastActive
 		}
-		// Check content blocks for tool_use — stop_reason is unreliable
-		// per Claude Code source (messages.ts:834).
-		// tool_use = session needs user action (permission approval,
-		// AskUserQuestion, ExitPlanMode, etc.)
-		if entry.hasToolUse() {
-			return "waiting", lastActive
+		// Classify tool_use blocks by whether they need user permission.
+		// Auto-approved tools (Read, Grep, etc.) → "working"
+		// Permission-required tools (Bash, Edit, etc.) → "waiting"
+		if s := entry.toolUseState(); s != "" {
+			return s, lastActive
 		}
 		// No tool_use blocks = response complete, unless still streaming
 		// (empty stop_reason + fresh file = still generating)
@@ -693,11 +692,37 @@ func (e jsonlEntry) contentBlocks() []contentBlock {
 	return blocks
 }
 
-func (e jsonlEntry) hasToolUse() bool {
+// toolUseState classifies what the tool_use blocks mean for session state.
+// Returns "waiting" if any tool needs user interaction, "working" if all
+// tools are auto-approved, or "" if no tool_use blocks found.
+func (e jsonlEntry) toolUseState() string {
+	hasAny := false
 	for _, b := range e.contentBlocks() {
-		if b.Type == "tool_use" {
-			return true
+		if b.Type != "tool_use" {
+			continue
 		}
+		hasAny = true
+		if !autoApprovedTool(b.Name) {
+			return "waiting"
+		}
+	}
+	if hasAny {
+		return "working"
+	}
+	return ""
+}
+
+// autoApprovedTool returns true for tools that never require user permission.
+// These tools execute immediately without a permission prompt.
+func autoApprovedTool(name string) bool {
+	switch name {
+	case "Read", "Glob", "Grep", "ToolSearch", "LSP",
+		"ListMcpResources", "ReadMcpResource",
+		"TodoWrite", "TaskCreate", "TaskUpdate", "TaskOutput",
+		"TaskStop", "TaskGet", "TaskList",
+		"Brief", "Agent", "SendMessage",
+		"EnterPlanMode", "EnterWorktree", "ExitWorktree":
+		return true
 	}
 	return false
 }
