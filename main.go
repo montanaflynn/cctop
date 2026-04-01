@@ -541,9 +541,13 @@ func inferStateFromLastEntry(line string, mtime time.Time, lastActive string) (s
 			return "idle", lastActive
 		}
 		// Classify tool_use blocks by whether they need user permission.
-		// Auto-approved tools (Read, Grep, etc.) → "working"
-		// Permission-required tools (Bash, Edit, etc.) → "waiting"
+		// Auto-approved tools (Read, Grep, etc.) → always "working"
+		// Others → "working" for first 3s (tool may be executing), then
+		// "waiting" if no new JSONL writes (likely blocked on permission).
 		if s := entry.toolUseState(); s != "" {
+			if s == "waiting" && !mtime.IsZero() && time.Since(mtime) < 3*time.Second {
+				return "working", lastActive
+			}
 			return s, lastActive
 		}
 		// No tool_use blocks = response complete, unless still streaming
