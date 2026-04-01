@@ -72,8 +72,7 @@ type sessionStats struct {
 	cacheCreate  int64
 	toolUses     int
 	turns        int
-	lastLine     string
-	sessionState string // from session_state_changed events: "idle", "running", "requires_action"
+	lastLine string
 }
 
 func (s *sessionStats) shortModel() string {
@@ -99,7 +98,6 @@ var (
 type statsJsonlEntry struct {
 	Type    string `json:"type"`
 	Subtype string `json:"subtype,omitempty"`
-	State   string `json:"state,omitempty"` // for session_state_changed events
 	Message struct {
 		Model      string          `json:"model"`
 		StopReason string          `json:"stop_reason"`
@@ -185,11 +183,6 @@ func updateStats(sessionID, path string) *sessionStats {
 			stats.turns++
 		}
 
-		// Track authoritative session state from session_state_changed events
-		// (available when CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1)
-		if e.Type == "system" && e.Subtype == "session_state_changed" && e.State != "" {
-			stats.sessionState = e.State
-		}
 	}
 
 	stats.offset = info.Size()
@@ -489,25 +482,9 @@ func sessionStateFromStats(p processInfo, stats *sessionStats, path string) (sta
 		}
 	}
 
-	// If CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1 is set, we get
-	// authoritative state events directly from Claude Code.
-	// Maps: "idle" → "idle", "running" → "working", "requires_action" → "waiting"
-	if stats.sessionState != "" {
-		stale := !mtime.IsZero() && time.Since(mtime) > 30*time.Second
-		if stale {
-			return "idle", lastActive
-		}
-		switch stats.sessionState {
-		case "running":
-			return "working", lastActive
-		case "requires_action":
-			return "waiting", lastActive
-		default:
-			return "idle", lastActive
-		}
-	}
-
-	// Fallback: infer state from the last JSONL entry
+	// Fallback: infer state from the last JSONL entry.
+	// If the last entry is a session_state_changed event
+	// (CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1), use it directly.
 	return inferStateFromLastEntry(stats.lastLine, mtime, lastActive)
 }
 
@@ -528,6 +505,18 @@ func inferStateFromLastEntry(line string, mtime time.Time, lastActive string) (s
 	switch entry.Type {
 	case "system":
 		switch entry.Subtype {
+		case "session_state_changed":
+			// Authoritative state from Claude Code
+			// (CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1)
+			if !stale {
+				switch entry.State {
+				case "running":
+					return "working", lastActive
+				case "requires_action":
+					return "waiting", lastActive
+				}
+			}
+			return "idle", lastActive
 		case "api_retry":
 			// Retrying an API call — still working, not idle
 			return "working", lastActive
@@ -657,6 +646,7 @@ func jsonlPath(sessionID, cwd string) string {
 type jsonlEntry struct {
 	Type    string `json:"type"`
 	Subtype string `json:"subtype,omitempty"`
+	State   string `json:"state,omitempty"`
 	Message struct {
 		StopReason string          `json:"stop_reason"`
 		Content    json.RawMessage `json:"content"`
