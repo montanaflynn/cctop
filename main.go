@@ -640,7 +640,34 @@ func jsonlPath(sessionID, cwd string) string {
 		return ""
 	}
 	encoded := strings.ReplaceAll(cwd, "/", "-")
-	return filepath.Join(home, ".claude", "projects", encoded, sessionID+".jsonl")
+	direct := filepath.Join(home, ".claude", "projects", encoded, sessionID+".jsonl")
+	if _, err := os.Stat(direct); err == nil {
+		return direct
+	}
+
+	// Resumed sessions write to the original session's JSONL file.
+	// Fall back to the most recently modified .jsonl in the project dir.
+	dir := filepath.Join(home, ".claude", "projects", encoded)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var bestPath string
+	var bestTime time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(bestTime) {
+			bestTime = info.ModTime()
+			bestPath = filepath.Join(dir, e.Name())
+		}
+	}
+	return bestPath
 }
 
 type jsonlEntry struct {
