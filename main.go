@@ -107,16 +107,17 @@ var (
 )
 
 type forgeCacheEntry struct {
-	updatedAt    string
-	cwd          string
-	lastRole     string
-	lastHasTools bool
-	model        string
-	inputTokens  int64
-	outputTokens int64
-	cacheRead    int64
-	turns        int
-	toolUses     int
+	updatedAt       string
+	cwd             string
+	lastRole        string
+	lastHasTools    bool
+	lastIsQuestion  bool // last assistant message ends with "?"
+	model           string
+	inputTokens     int64
+	outputTokens    int64
+	cacheRead       int64
+	turns           int
+	toolUses        int
 }
 
 type statsJsonlEntry struct {
@@ -825,6 +826,7 @@ type forgeSession struct {
 	Stats          *sessionStats
 	lastRole       string // role of the last message
 	lastHasTools   bool   // last assistant message had tool_calls
+	lastIsQuestion bool   // last assistant message ends with "?"
 }
 
 // loadForgeSessions queries ~/forge/.forge.db for active conversations
@@ -910,18 +912,19 @@ func loadForgeSessions(procs map[int]processInfo) []forgeSession {
 			}
 			if err := json.Unmarshal(ctxOut, &ctxRows); err == nil {
 				for _, cr := range ctxRows {
-					cwd, lastRole, lastHasTools, model, ctxTurns := parseForgeContext(cr.Context)
+					cwd, lastRole, lastHasTools, lastIsQuestion, model, ctxTurns := parseForgeContext(cr.Context)
 					inputTokens, outputTokens, cacheRead := parseForgeStats(cr.ID)
 					forgeCache[cr.ID] = forgeCacheEntry{
-						updatedAt:    cr.UpdatedAt,
-						cwd:          cwd,
-						lastRole:     lastRole,
-						lastHasTools: lastHasTools,
-						model:        model,
-						inputTokens:  inputTokens,
-						outputTokens: outputTokens,
-						cacheRead:    cacheRead,
-						turns:        ctxTurns,
+						updatedAt:      cr.UpdatedAt,
+						cwd:            cwd,
+						lastRole:       lastRole,
+						lastHasTools:   lastHasTools,
+						lastIsQuestion: lastIsQuestion,
+						model:          model,
+						inputTokens:    inputTokens,
+						outputTokens:   outputTokens,
+						cacheRead:      cacheRead,
+						turns:          ctxTurns,
 					}
 				}
 			}
@@ -963,6 +966,7 @@ func loadForgeSessions(procs map[int]processInfo) []forgeSession {
 			Stats:          stats,
 			lastRole:       cached.lastRole,
 			lastHasTools:   cached.lastHasTools,
+			lastIsQuestion: cached.lastIsQuestion,
 		})
 	}
 
@@ -972,7 +976,7 @@ func loadForgeSessions(procs map[int]processInfo) []forgeSession {
 // parseForgeContext extracts the working directory, last message role,
 // and whether the last assistant message had tool calls from the
 // conversation context JSON.
-func parseForgeContext(contextJSON string) (cwd, lastRole string, lastHasTools bool, model string, turns int) {
+func parseForgeContext(contextJSON string) (cwd, lastRole string, lastHasTools, lastIsQuestion bool, model string, turns int) {
 	if contextJSON == "" {
 		return
 	}
@@ -1043,6 +1047,7 @@ func parseForgeContext(contextJSON string) (cwd, lastRole string, lastHasTools b
 				lastRole = role
 				if role == "Assistant" {
 					lastHasTools = len(m.Message.Text.ToolCalls) > 0
+					lastIsQuestion = strings.HasSuffix(strings.TrimSpace(m.Message.Text.Content), "?")
 				}
 				break
 			}
@@ -1145,7 +1150,10 @@ func forgeSessionState(p processInfo, fs forgeSession) (state, lastActive string
 			if fs.lastHasTools {
 				return "working", "now"
 			}
-			return "waiting", "now"
+			if fs.lastIsQuestion {
+				return "waiting", "now"
+			}
+			return "idle", "now"
 		}
 		return "working", "now"
 	}
@@ -1153,7 +1161,7 @@ func forgeSessionState(p processInfo, fs forgeSession) (state, lastActive string
 	// Not recently updated — check last message state
 	switch fs.lastRole {
 	case "Assistant":
-		if !fs.lastHasTools {
+		if !fs.lastHasTools && fs.lastIsQuestion {
 			return "waiting", lastActive
 		}
 	case "ToolResult":
