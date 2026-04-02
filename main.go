@@ -528,6 +528,11 @@ func lastEntryState(line string) string {
 		if s := entry.toolUseState(); s != "" {
 			return s
 		}
+		// Response ended with a question mark — Claude is asking
+		// the user something without using the formal question tool.
+		if entry.endsWithQuestion() {
+			return "waiting"
+		}
 		return ""
 
 	case "user":
@@ -678,6 +683,7 @@ type jsonlEntry struct {
 type contentBlock struct {
 	Type string `json:"type"`
 	Name string `json:"name,omitempty"`
+	Text string `json:"text,omitempty"`
 }
 
 func (e jsonlEntry) contentBlocks() []contentBlock {
@@ -730,6 +736,19 @@ func (e jsonlEntry) hasToolResult() bool {
 		}
 	}
 	return false
+}
+
+// endsWithQuestion returns true if the last text block in the message
+// ends with a question mark, indicating Claude asked the user something
+// without using the formal question tool.
+func (e jsonlEntry) endsWithQuestion() bool {
+	var last string
+	for _, b := range e.contentBlocks() {
+		if b.Type == "text" && b.Text != "" {
+			last = b.Text
+		}
+	}
+	return strings.HasSuffix(strings.TrimSpace(last), "?")
 }
 
 func parseEntry(line string) (jsonlEntry, bool) {
