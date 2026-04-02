@@ -33,10 +33,12 @@ type processInfo struct {
 	Stat string
 	CPU  float64
 	TTY  string
+	Comm string // "claude" or "forge"
 }
 
 type entry struct {
 	PID        int
+	Agent      string // "claude" or "forge"
 	State      string
 	Name       string
 	Cwd        string
@@ -96,6 +98,26 @@ var (
 	statsCache = make(map[string]*sessionStats)
 	statsMu    sync.Mutex
 )
+
+// forgeCache stores parsed Forge sessions keyed by conversation ID.
+// We only re-parse the full context when updated_at changes.
+var (
+	forgeCache   = make(map[string]forgeCacheEntry)
+	forgeCacheMu sync.Mutex
+)
+
+type forgeCacheEntry struct {
+	updatedAt    string
+	cwd          string
+	lastRole     string
+	lastHasTools bool
+	model        string
+	inputTokens  int64
+	outputTokens int64
+	cacheRead    int64
+	turns        int
+	toolUses     int
+}
 
 type statsJsonlEntry struct {
 	Type    string `json:"type"`
@@ -282,13 +304,13 @@ func (m model) View() string {
 	b.WriteString("\n\n")
 
 	if len(m.entries) == 0 {
-		b.WriteString("No running Claude sessions found.\n")
+		b.WriteString("No running Claude Code or Forge sessions found.\n")
 		b.WriteString(dimStyle.Render("\nq quit"))
 		return b.String()
 	}
 
 	// Table columns
-	cols := [...]string{"PID", "STATE", "MODEL", "CWD", "APP", "ACTIVE", "START"}
+	cols := [...]string{"PID", "STATE", "AGENT", "MODEL", "CWD", "APP", "ACTIVE", "START"}
 	numCols := len(cols)
 	widths := make([]int, numCols)
 	for i, c := range cols {
@@ -380,7 +402,7 @@ func renderDetails(e entry, width int) string {
 	return b.String()
 }
 
-func rowValues(e entry) [7]string {
+func rowValues(e entry) [8]string {
 	dash := func(s string) string {
 		if s == "" {
 			return "-"
@@ -391,9 +413,10 @@ func rowValues(e entry) [7]string {
 	if e.Stats != nil {
 		model = e.Stats.shortModel()
 	}
-	return [7]string{
+	return [8]string{
 		strconv.Itoa(e.PID),
 		e.State,
+		dash(e.Agent),
 		model,
 		dash(e.Cwd),
 		dash(e.App),
@@ -427,19 +450,21 @@ func killProcess(pid int) tea.Cmd {
 
 func loadEntries() []entry {
 	sessions := loadSessions()
-	procs := getClaudeProcesses()
+	procs := getAgentProcesses()
 
 	var entries []entry
 	matched := make(map[int]bool)
 
+	// Claude Code sessions (from ~/.claude/sessions/)
 	for _, s := range sessions {
-		if p, ok := procs[s.PID]; ok {
+		if p, ok := procs[s.PID]; ok && p.Comm == "claude" {
 			path := jsonlPath(s.SessionID, s.Cwd)
 			stats := updateStats(s.SessionID, path)
 			state, active := sessionStateFromStats(p, stats, path)
 
 			e := entry{
 				PID:        s.PID,
+				Agent:      "claude",
 				State:      state,
 				Name:       s.Name,
 				Cwd:        shortenPath(s.Cwd),
@@ -455,12 +480,33 @@ func loadEntries() []entry {
 		}
 	}
 
+	// Forge sessions (from ~/forge/.forge.db)
+	forgeSessions := loadForgeSessions(procs)
+	for _, fs := range forgeSessions {
+		if p, ok := procs[fs.PID]; ok && p.Comm == "forge" {
+			state, active := forgeSessionState(p, fs)
+			entries = append(entries, entry{
+				PID:        fs.PID,
+				Agent:      "forge",
+				State:      state,
+				Cwd:        shortenPath(fs.Cwd),
+				App:        findTerminalApp(fs.PID),
+				Start:      fs.Start,
+				LastActive: active,
+				Stats:      fs.Stats,
+			})
+			matched[fs.PID] = true
+		}
+	}
+
+	// Unmatched processes (no session file/DB record found)
 	for pid, p := range procs {
 		if matched[pid] {
 			continue
 		}
 		entries = append(entries, entry{
 			PID:   pid,
+			Agent: p.Comm,
 			State: inferState(p),
 			Cwd:   shortenPath(getCwdFromLsof(pid)),
 			App:   findTerminalApp(pid),
@@ -587,7 +633,7 @@ func loadSessions() []session {
 	return sessions
 }
 
-func getClaudeProcesses() map[int]processInfo {
+func getAgentProcesses() map[int]processInfo {
 	out, err := exec.Command("ps", "-eo", "pid,stat,%cpu,tty,comm").Output()
 	if err != nil {
 		return nil
@@ -599,7 +645,8 @@ func getClaudeProcesses() map[int]processInfo {
 		if len(fields) < 5 {
 			continue
 		}
-		if filepath.Base(fields[4]) != "claude" {
+		base := filepath.Base(fields[4])
+		if base != "claude" && base != "forge" {
 			continue
 		}
 		pid, err := strconv.Atoi(fields[0])
@@ -612,6 +659,7 @@ func getClaudeProcesses() map[int]processInfo {
 			Stat: fields[1],
 			CPU:  cpu,
 			TTY:  fields[3],
+			Comm: base,
 		}
 	}
 	return procs
@@ -764,6 +812,355 @@ func parseEntry(line string) (jsonlEntry, bool) {
 		return e, false
 	}
 	return e, true
+}
+
+// ── Forge session support ──────────────────────────────────────────
+
+type forgeSession struct {
+	PID            int
+	ConversationID string
+	Cwd            string
+	Start          string
+	UpdatedAt      time.Time
+	Stats          *sessionStats
+	lastRole       string // role of the last message
+	lastHasTools   bool   // last assistant message had tool_calls
+}
+
+// loadForgeSessions queries ~/forge/.forge.db for active conversations
+// and matches them to running forge processes.
+func loadForgeSessions(procs map[int]processInfo) []forgeSession {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	dbPath := filepath.Join(home, "forge", ".forge.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil
+	}
+
+	// Build a cwd -> pid map from already-discovered forge processes
+	forgePIDs := make(map[string]int) // cwd -> pid
+	for pid, p := range procs {
+		if p.Comm != "forge" {
+			continue
+		}
+		cwd := getCwdFromLsof(pid)
+		if cwd != "" {
+			forgePIDs[cwd] = pid
+		}
+	}
+
+	if len(forgePIDs) == 0 {
+		return nil
+	}
+
+	// Step 1: lightweight query for metadata only (no context blob).
+	metaQuery := `SELECT json_group_array(json_object(
+		'id', conversation_id,
+		'created_at', created_at,
+		'updated_at', updated_at,
+		'metrics', metrics
+	)) FROM (SELECT * FROM conversations WHERE context IS NOT NULL ORDER BY updated_at DESC LIMIT 20);`
+	metaOut, err := exec.Command("sqlite3", dbPath, metaQuery).Output()
+	if err != nil {
+		return nil
+	}
+
+	var rows []struct {
+		ID        string `json:"id"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		Metrics   string `json:"metrics"`
+	}
+	if err := json.Unmarshal(metaOut, &rows); err != nil {
+		return nil
+	}
+
+	forgeCacheMu.Lock()
+	defer forgeCacheMu.Unlock()
+
+	// Step 2: for each row, check cache. Only fetch full context if updated_at changed.
+	var needContext []string
+	for _, row := range rows {
+		cached, ok := forgeCache[row.ID]
+		if !ok || cached.updatedAt != row.UpdatedAt {
+			needContext = append(needContext, row.ID)
+		}
+	}
+
+	// Fetch full context for conversations that changed.
+	if len(needContext) > 0 {
+		// Build a query that fetches all needed contexts in one call.
+		var placeholders []string
+		for _, id := range needContext {
+			placeholders = append(placeholders, fmt.Sprintf("'%s'", id))
+		}
+		ctxQuery := fmt.Sprintf(`SELECT json_group_array(json_object(
+			'id', conversation_id,
+			'updated_at', updated_at,
+			'context', context
+		)) FROM conversations WHERE conversation_id IN (%s);`, strings.Join(placeholders, ","))
+		ctxOut, err := exec.Command("sqlite3", dbPath, ctxQuery).Output()
+		if err == nil {
+			var ctxRows []struct {
+				ID        string `json:"id"`
+				UpdatedAt string `json:"updated_at"`
+				Context   string `json:"context"`
+			}
+			if err := json.Unmarshal(ctxOut, &ctxRows); err == nil {
+				for _, cr := range ctxRows {
+					cwd, lastRole, lastHasTools, model, ctxTurns := parseForgeContext(cr.Context)
+					inputTokens, outputTokens, cacheRead := parseForgeStats(cr.ID)
+					forgeCache[cr.ID] = forgeCacheEntry{
+						updatedAt:    cr.UpdatedAt,
+						cwd:          cwd,
+						lastRole:     lastRole,
+						lastHasTools: lastHasTools,
+						model:        model,
+						inputTokens:  inputTokens,
+						outputTokens: outputTokens,
+						cacheRead:    cacheRead,
+						turns:        ctxTurns,
+					}
+				}
+			}
+		}
+	}
+
+	// Step 3: build sessions from cache + metadata.
+	var sessions []forgeSession
+	matched := make(map[int]bool)
+
+	for _, row := range rows {
+		cached, ok := forgeCache[row.ID]
+		if !ok || cached.cwd == "" {
+			continue
+		}
+
+		pid, ok := forgePIDs[cached.cwd]
+		if !ok || matched[pid] {
+			continue
+		}
+		matched[pid] = true
+
+		stats := parseForgeMetrics(row.Metrics, cached.model, cached)
+
+		updatedTime, _ := time.Parse("2006-01-02 15:04:05.999999", row.UpdatedAt)
+		createdTime, _ := time.Parse("2006-01-02 15:04:05.999999", row.CreatedAt)
+
+		var start string
+		if !createdTime.IsZero() {
+			start = formatTimestamp(createdTime)
+		}
+
+		sessions = append(sessions, forgeSession{
+			PID:            pid,
+			ConversationID: row.ID,
+			Cwd:            cached.cwd,
+			Start:          start,
+			UpdatedAt:      updatedTime,
+			Stats:          stats,
+			lastRole:       cached.lastRole,
+			lastHasTools:   cached.lastHasTools,
+		})
+	}
+
+	return sessions
+}
+
+// parseForgeContext extracts the working directory, last message role,
+// and whether the last assistant message had tool calls from the
+// conversation context JSON.
+func parseForgeContext(contextJSON string) (cwd, lastRole string, lastHasTools bool, model string, turns int) {
+	if contextJSON == "" {
+		return
+	}
+
+	var ctx struct {
+		Messages []struct {
+			Message struct {
+				Text *struct {
+					Role      string `json:"role"`
+					Content   string `json:"content"`
+					Model     string `json:"model"`
+					ToolCalls []struct {
+						Name string `json:"name"`
+					} `json:"tool_calls"`
+				} `json:"text"`
+				Tool *struct {
+					Name   string `json:"name"`
+					Output struct {
+						Values []struct {
+							Text string `json:"text"`
+						} `json:"values"`
+					} `json:"output"`
+				} `json:"tool"`
+			} `json:"message"`
+		} `json:"messages"`
+	}
+
+	if err := json.Unmarshal([]byte(contextJSON), &ctx); err != nil {
+		return
+	}
+
+	// Extract model from first message's text.model field
+	for _, m := range ctx.Messages {
+		if m.Message.Text != nil && m.Message.Text.Model != "" {
+			model = m.Message.Text.Model
+			break
+		}
+	}
+
+	// Extract CWD from the system prompt. Forge puts system info
+	// (including <current_working_directory>) in a System message.
+	for _, m := range ctx.Messages {
+		if m.Message.Text != nil && m.Message.Text.Role == "System" {
+			content := m.Message.Text.Content
+			if idx := strings.Index(content, "<current_working_directory>"); idx >= 0 {
+				start := idx + len("<current_working_directory>")
+				if end := strings.Index(content[start:], "</current_working_directory>"); end >= 0 {
+					cwd = content[start : start+end]
+					break
+				}
+			}
+		}
+	}
+
+	// Count user turns
+	for _, m := range ctx.Messages {
+		if m.Message.Text != nil && m.Message.Text.Role == "User" {
+			turns++
+		}
+	}
+
+	// Find last meaningful message
+	for i := len(ctx.Messages) - 1; i >= 0; i-- {
+		m := ctx.Messages[i]
+		if m.Message.Text != nil {
+			role := m.Message.Text.Role
+			if role == "Assistant" || role == "User" {
+				lastRole = role
+				if role == "Assistant" {
+					lastHasTools = len(m.Message.Text.ToolCalls) > 0
+				}
+				break
+			}
+		}
+		if m.Message.Tool != nil {
+			// Tool result means assistant is about to respond
+			lastRole = "ToolResult"
+			break
+		}
+	}
+
+	return
+}
+
+// parseForgeStats runs "forge conversation info" and parses token usage.
+// Only called when the cache needs to be refreshed.
+func parseForgeStats(conversationID string) (inputTokens, outputTokens, cacheRead int64) {
+	out, err := exec.Command("forge", "conversation", "info", conversationID).Output()
+	if err != nil {
+		return
+	}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "input tokens"):
+			inputTokens = parseCommaSeparatedInt(strings.TrimPrefix(line, "input tokens"))
+		case strings.HasPrefix(line, "output tokens"):
+			outputTokens = parseCommaSeparatedInt(strings.TrimPrefix(line, "output tokens"))
+		case strings.HasPrefix(line, "cached tokens"):
+			// "cached tokens 6,215,831 [95%]" — extract number before [
+			field := strings.TrimPrefix(line, "cached tokens")
+			if idx := strings.Index(field, "["); idx >= 0 {
+				field = field[:idx]
+			}
+			cacheRead = parseCommaSeparatedInt(field)
+		}
+	}
+	return
+}
+
+// parseCommaSeparatedInt parses a number like "6,508,295" into 6508295.
+func parseCommaSeparatedInt(s string) int64 {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, ",", "")
+	v, _ := strconv.ParseInt(s, 10, 64)
+	return v
+}
+
+func parseForgeMetrics(metricsJSON, model string, cached forgeCacheEntry) *sessionStats {
+	stats := &sessionStats{}
+	if model != "" {
+		stats.model = model
+	}
+	stats.inputTokens = cached.inputTokens
+	stats.outputTokens = cached.outputTokens
+	stats.cacheRead = cached.cacheRead
+	stats.turns = cached.turns
+
+	if metricsJSON == "" {
+		return stats
+	}
+
+	var metrics struct {
+		StartedAt    string                     `json:"started_at"`
+		FilesChanged map[string]json.RawMessage `json:"files_changed"`
+	}
+	if err := json.Unmarshal([]byte(metricsJSON), &metrics); err != nil {
+		return stats
+	}
+
+	stats.toolUses = len(metrics.FilesChanged)
+	return stats
+}
+
+// forgeSessionState determines the state of a Forge session.
+func forgeSessionState(p processInfo, fs forgeSession) (state, lastActive string) {
+	// High CPU = definitely working
+	if strings.HasPrefix(p.Stat, "R") || p.CPU > 5.0 {
+		return "working", "now"
+	}
+
+	if !fs.UpdatedAt.IsZero() {
+		if time.Since(fs.UpdatedAt) < time.Minute {
+			lastActive = "now"
+		} else {
+			lastActive = formatDuration(time.Since(fs.UpdatedAt)) + " ago"
+		}
+	}
+
+	// Fresh DB update means the session is active
+	if !fs.UpdatedAt.IsZero() && time.Since(fs.UpdatedAt) < 5*time.Second {
+		// Check last message to distinguish working vs waiting
+		switch fs.lastRole {
+		case "ToolResult":
+			return "working", "now"
+		case "User":
+			return "working", "now"
+		case "Assistant":
+			if fs.lastHasTools {
+				return "working", "now"
+			}
+			return "waiting", "now"
+		}
+		return "working", "now"
+	}
+
+	// Not recently updated — check last message state
+	switch fs.lastRole {
+	case "Assistant":
+		if !fs.lastHasTools {
+			return "waiting", lastActive
+		}
+	case "ToolResult":
+		return "working", lastActive
+	}
+
+	return "idle", lastActive
 }
 
 func findTerminalApp(pid int) string {
