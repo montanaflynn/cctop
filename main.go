@@ -73,7 +73,8 @@ type sessionStats struct {
 	cacheCreate  int64
 	toolUses     int
 	turns        int
-	lastLine string
+	lastLine      string
+	lastStateLine string // last assistant/user/progress line for state detection
 }
 
 func (s *sessionStats) shortModel() string {
@@ -157,6 +158,12 @@ func updateStats(sessionID, path string) *sessionStats {
 		var e statsJsonlEntry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			continue
+		}
+
+		// Track the last line relevant for state detection
+		switch e.Type {
+		case "assistant", "user", "progress":
+			stats.lastStateLine = line
 		}
 
 		if e.Type == "assistant" {
@@ -489,18 +496,18 @@ func sessionStateFromStats(p processInfo, stats *sessionStats, path string) (sta
 	if !mtime.IsZero() && time.Since(mtime) < 5*time.Second {
 		// File is actively being written — use last entry to
 		// distinguish working vs waiting for user approval.
-		if s := lastEntryState(stats.lastLine); s != "" {
+		if s := lastEntryState(stats.lastStateLine); s != "" {
 			return s, "now"
 		}
 		return "working", "now"
 	}
 
-	// File written recently but not right now — check if the last
-	// entry implies the session is blocked on something.
-	if !mtime.IsZero() && time.Since(mtime) < 30*time.Second {
-		if s := lastEntryState(stats.lastLine); s == "waiting" {
-			return "waiting", lastActive
-		}
+	// If the last JSONL entry indicates the session is blocked on
+	// something (tool approval or a question), keep it "waiting"
+	// regardless of how long ago the file was written — the user
+	// simply hasn't responded yet.
+	if s := lastEntryState(stats.lastStateLine); s == "waiting" {
+		return "waiting", lastActive
 	}
 
 	return "idle", lastActive
