@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,7 +73,8 @@ type sessionStats struct {
 	cacheCreate  int64
 	toolUses     int
 	turns        int
-	lastLine string
+	lastLine      string
+	lastStateLine string // last assistant/user/progress line for state detection
 }
 
 func (s *sessionStats) shortModel() string {
@@ -156,6 +158,12 @@ func updateStats(sessionID, path string) *sessionStats {
 		var e statsJsonlEntry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			continue
+		}
+
+		// Track the last line relevant for state detection
+		switch e.Type {
+		case "assistant", "user", "progress":
+			stats.lastStateLine = line
 		}
 
 		if e.Type == "assistant" {
@@ -463,7 +471,7 @@ func loadEntries() []entry {
 }
 
 func sessionStateFromStats(p processInfo, stats *sessionStats, path string) (state, lastActive string) {
-	// High CPU = definitely working regardless of JSONL state
+	// High CPU = definitely working
 	if strings.HasPrefix(p.Stat, "R") || p.CPU > 5.0 {
 		return "working", "now"
 	}
@@ -482,83 +490,71 @@ func sessionStateFromStats(p processInfo, stats *sessionStats, path string) (sta
 		}
 	}
 
-	// Fallback: infer state from the last JSONL entry.
-	// If the last entry is a session_state_changed event
-	// (CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1), use it directly.
-	return inferStateFromLastEntry(stats.lastLine, mtime, lastActive)
-}
-
-func inferStateFromLastEntry(line string, mtime time.Time, lastActive string) (string, string) {
-	if line == "" {
-		return "idle", lastActive
+	// Primary signal: file modification time. When Claude is working,
+	// the JSONL is being written to continuously. A fresh mtime is
+	// the strongest indicator of activity.
+	if !mtime.IsZero() && time.Since(mtime) < 5*time.Second {
+		// File is actively being written — use last entry to
+		// distinguish working vs waiting for user approval.
+		if s := lastEntryState(stats.lastStateLine); s != "" {
+			return s, "now"
+		}
+		return "working", "now"
 	}
 
-	entry, ok := parseEntry(line)
-	if !ok {
-		return "idle", lastActive
-	}
-
-	// If the JSONL hasn't been written to in >30s, trust that over the
-	// last entry's implied state — the process may have moved on.
-	stale := !mtime.IsZero() && time.Since(mtime) > 30*time.Second
-
-	switch entry.Type {
-	case "system":
-		switch entry.Subtype {
-		case "session_state_changed":
-			// Authoritative state from Claude Code
-			// (CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1)
-			if !stale {
-				switch entry.State {
-				case "running":
-					return "working", lastActive
-				case "requires_action":
-					return "waiting", lastActive
-				}
-			}
-			return "idle", lastActive
-		case "api_retry":
-			// Retrying an API call — still working, not idle
-			return "working", lastActive
-		case "compact_boundary":
-			// Context compaction in progress
-			if !stale {
-				return "working", lastActive
-			}
-		}
-		// turn_duration and other system subtypes = turn is over
-		return "idle", lastActive
-
-	case "user":
-		// tool_result = tool finished, assistant is about to process it
-		if !stale && entry.hasToolResult() {
-			return "working", lastActive
-		}
-		return "idle", lastActive
-
-	case "assistant":
-		if stale {
-			return "idle", lastActive
-		}
-		// Classify tool_use blocks by whether they need user permission.
-		// Auto-approved tools (Read, Grep, etc.) → always "working"
-		// Others → "working" for first 3s (tool may be executing), then
-		// "waiting" if no new JSONL writes (likely blocked on permission).
-		if s := entry.toolUseState(); s != "" {
-			if s == "waiting" && !mtime.IsZero() && time.Since(mtime) < 3*time.Second {
-				return "working", lastActive
-			}
-			return s, lastActive
-		}
-		// No tool_use blocks = response complete, unless still streaming
-		// (empty stop_reason + fresh file = still generating)
-		if entry.Message.StopReason == "" {
-			return "working", lastActive
-		}
-		return "idle", lastActive
+	// If the last JSONL entry indicates the session is blocked on
+	// something (tool approval or a question), keep it "waiting"
+	// regardless of how long ago the file was written — the user
+	// simply hasn't responded yet.
+	if s := lastEntryState(stats.lastStateLine); s == "waiting" {
+		return "waiting", lastActive
 	}
 
 	return "idle", lastActive
+}
+
+// lastEntryState returns "working", "waiting", or "" based on the
+// last JSONL line. Only used to distinguish working vs waiting when
+// we already know the file is fresh.
+func lastEntryState(line string) string {
+	if line == "" {
+		return ""
+	}
+	entry, ok := parseEntry(line)
+	if !ok {
+		return ""
+	}
+
+	switch entry.Type {
+	case "assistant":
+		// Still streaming (no stop_reason yet)
+		if entry.Message.StopReason == "" {
+			return "working"
+		}
+		// Tool call — check if it needs user approval
+		if s := entry.toolUseState(); s != "" {
+			return s
+		}
+		// Response ended with a question mark — Claude is asking
+		// the user something without using the formal question tool.
+		if entry.endsWithQuestion() {
+			return "waiting"
+		}
+		return ""
+
+	case "user":
+		// Tool result just came back — Claude is about to respond
+		if entry.hasToolResult() {
+			return "working"
+		}
+		// User sent a message — Claude should start soon
+		return "working"
+
+	case "progress":
+		return "working"
+	}
+
+	return ""
 }
 
 func loadSessions() []session {
@@ -634,6 +630,15 @@ func getCwdFromLsof(pid int) string {
 	return ""
 }
 
+// sanitizePath mirrors Claude Code's sanitizePath from
+// utils/sessionStoragePortable.ts — replaces ALL non-alphanumeric
+// characters with hyphens, not just slashes.
+var nonAlphanumeric = regexp.MustCompile(`[^a-zA-Z0-9]`)
+
+func sanitizePath(name string) string {
+	return nonAlphanumeric.ReplaceAllString(name, "-")
+}
+
 func jsonlPath(sessionID, cwd string) string {
 	if sessionID == "" || cwd == "" {
 		return ""
@@ -642,7 +647,7 @@ func jsonlPath(sessionID, cwd string) string {
 	if err != nil {
 		return ""
 	}
-	encoded := strings.ReplaceAll(cwd, "/", "-")
+	encoded := sanitizePath(cwd)
 	direct := filepath.Join(home, ".claude", "projects", encoded, sessionID+".jsonl")
 	if _, err := os.Stat(direct); err == nil {
 		return direct
@@ -676,7 +681,6 @@ func jsonlPath(sessionID, cwd string) string {
 type jsonlEntry struct {
 	Type    string `json:"type"`
 	Subtype string `json:"subtype,omitempty"`
-	State   string `json:"state,omitempty"`
 	Message struct {
 		StopReason string          `json:"stop_reason"`
 		Content    json.RawMessage `json:"content"`
@@ -686,6 +690,7 @@ type jsonlEntry struct {
 type contentBlock struct {
 	Type string `json:"type"`
 	Name string `json:"name,omitempty"`
+	Text string `json:"text,omitempty"`
 }
 
 func (e jsonlEntry) contentBlocks() []contentBlock {
@@ -738,6 +743,19 @@ func (e jsonlEntry) hasToolResult() bool {
 		}
 	}
 	return false
+}
+
+// endsWithQuestion returns true if the last text block in the message
+// ends with a question mark, indicating Claude asked the user something
+// without using the formal question tool.
+func (e jsonlEntry) endsWithQuestion() bool {
+	var last string
+	for _, b := range e.contentBlocks() {
+		if b.Type == "text" && b.Text != "" {
+			last = b.Text
+		}
+	}
+	return strings.HasSuffix(strings.TrimSpace(last), "?")
 }
 
 func parseEntry(line string) (jsonlEntry, bool) {
